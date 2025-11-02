@@ -1,0 +1,37 @@
+ranks:
+  Captain: 上校
+  Commander: 中校
+  Lieutenant Commander: 少校
+  Lieutenant: 上尉
+
+roles:
+  captain: 舰长
+  commander: 副舰长
+  operations manager: 操作官
+  security chief: 安全官
+  flight controller: 舵手
+  Number One: 大副
+  chief engineer: 轮机长
+
+disambiguation:
+  captain_rules:
+    as_rank_if_patterns:
+      - "promoted to Captain"
+      - "rank of Captain"
+      - "Captain in Starfleet"
+      - "holds the rank of Captain"
+      - "as a Captain in"
+    as_role_if_patterns:
+      - "Captain {NAME}"
+      - "the captain of the"
+      - "ship's captain"
+      - "report to the captain"
+      - "as the captain"
+    priority: role_over_rank_if_no_name
+
+output_style:
+  name_rank_position: after
+  keep_inline_markup: true
+  tone: formal
+
+on_unknown_term: 保留英文并报告
