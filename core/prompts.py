@@ -23,15 +23,10 @@ def build_system_prompt(rules: dict,
             "ships_translate": rules.get("ships_translate", True),
             "ranks": rules.get("ranks", {}),
             "name_rank_position": rules.get("name_rank_position", "after"),
-            "first_deck_term": rules.get("first_deck_term", "一号甲板"),
-            "tellar_term": rules.get("tellar_term", "泰拉"),
-            "dax_rank_override": rules.get("dax_rank_override", "上尉"),
-            "chen_trryssa_rank_override": rules.get("chen_trryssa_rank_override", "中尉"),
             "keep_inline_markup": rules.get("output_style", {}).get("keep_inline_markup", True),
             "on_unknown_term": rules.get("on_unknown_term", "保留英文并报告")
         },
         "glossary_active_subset": gmap,
-        # 空也没关系：我们现在不依赖名单
         "names_do_not_translate_detected": names_do_not_translate,
         "style": rules.get("output_style", {}),
         "output_contract": {
