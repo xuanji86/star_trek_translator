@@ -8,7 +8,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 from openai import OpenAI
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple  # 添加 Tuple
 
 from core.tokenizer import estimate_tokens
 from core.pricing import DEFAULT_PRICING, estimate_cost
@@ -32,7 +32,7 @@ from core.batching import chapters_from_folder, build_batch_jsonl
 def _normalize_newlines(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
-def _safe_paragraphs(text: str) -> list[str]:
+def _safe_paragraphs(text: str) -> List[str]:
     t = _normalize_newlines(text)
     paras = [p.strip() for p in re.split(r"\n{2,}", t) if p and p.strip()]
     if paras:
@@ -51,7 +51,7 @@ def split_text_by_tokens(text: str, model: str, max_input_tokens: int = 6000):
         return
     budget = max(1000, int(max_input_tokens or 6000))
     units = _safe_paragraphs(text)
-    buf: list[str] = []
+    buf: List[str] = []
     buf_tokens = 0
     for u in units:
         t = estimate_tokens(u, model)
@@ -75,7 +75,7 @@ def translate_full_text(adapter: Translator, system_prompt: str, text: str, mode
     chunks = list(split_text_by_tokens(text, model, max_input_tokens=max_input_tokens))
     if not chunks:
         return ""
-    outputs: list[str] = []
+    outputs: List[str] = []
     for i, ck in enumerate(chunks, 1):
         st.info(f"翻译分段 {i}/{len(chunks)}…")
         res = adapter.translate_once(system_prompt=system_prompt, user_text=ck)
@@ -96,8 +96,8 @@ def _save_results_jsonl_bytes(client: OpenAI, file_id: str, out_path: Path) -> N
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(content)
 
-def _parse_results_jsonl(jsonl_path: Path) -> list[dict]:
-    results: list[dict] = []
+def _parse_results_jsonl(jsonl_path: Path) -> List[dict]:
+    results: List[dict] = []
     if not jsonl_path.exists():
         return results
     for line in jsonl_path.read_text(encoding="utf-8").splitlines():
@@ -116,9 +116,9 @@ def _parse_results_jsonl(jsonl_path: Path) -> list[dict]:
         results.append({"custom_id": cid, "text": text, "raw": body})
     return results
 
-def _write_txt_outputs(results: list[dict], out_dir: Path) -> list[Path]:
+def _write_txt_outputs(results: List[dict], out_dir: Path) -> List[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
-    paths: list[Path] = []
+    paths: List[Path] = []
     for r in results:
         cid = (r.get("custom_id") or "unknown").replace("/", "_")
         p = out_dir / f"{cid}.txt"
@@ -126,13 +126,117 @@ def _write_txt_outputs(results: list[dict], out_dir: Path) -> list[Path]:
         paths.append(p)
     return paths
 
-def _zip_paths(paths: list[Path]) -> bytes:
+def _zip_paths(paths: List[Path]) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for p in paths:
             zf.write(p, arcname=p.name)
     buf.seek(0)
     return buf.read()
+
+# =============================
+# 质检与修复辅助函数
+# =============================
+
+def _merge_corpora_for_check(corpora: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    try:
+        return merge_corpora(corpora)
+    except Exception:
+        frames = []
+        for name, df in (corpora or {}).items():
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                tmp = df.copy()
+                if "corpus" not in tmp.columns:
+                    tmp["corpus"] = name
+                frames.append(tmp)
+        if not frames:
+            return pd.DataFrame(columns=["source", "target", "type", "note", "corpus"])
+        out = pd.concat(frames, ignore_index=True)
+        out = out.drop_duplicates(subset=["source", "target", "type"], keep="first")
+        return out
+
+def _collect_rank_words(merged: pd.DataFrame) -> List[str]:
+    if merged is None or merged.empty:
+        return ["上校", "中校", "少校", "上尉", "中尉", "少尉", "舰长"]
+    # 只取 type == rank 的 target
+    try:
+        ranks = merged[merged["type"] == "rank"]["target"].dropna().astype(str).tolist()
+    except Exception:
+        ranks = []
+    ranks = sorted({r.strip() for r in ranks if r.strip()}, key=len, reverse=True)
+    return ranks or ["上校", "中校", "少校", "上尉", "中尉", "少尉", "舰长"]
+
+def _normalize_paragraphs(txt: str) -> str:
+    if not isinstance(txt, str):
+        return ""
+    t = txt.replace("\r\n", "\n").replace("\r", "\n")
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    lines = [ln.rstrip() for ln in t.split("\n")]
+    fixed: List[str] = []
+    for i, ln in enumerate(lines):
+        fixed.append(ln)
+        if ln.strip() and i + 1 < len(lines) and lines[i + 1].strip():
+            fixed.append("")
+    t = "\n".join(fixed)
+    t = t.strip("\n")
+    t = re.sub(r"(\n)\s*(\n)", "\n\n", t)
+    return t
+
+def _find_rank_order_issues(translated: str, rank_words: List[str]) -> List[Tuple[str, str, int, int]]:
+    """检测到 “军衔 在前、名字 在后”的违例，返回 (rank, name, start, end)。"""
+    if not translated:
+        return []
+    name_en = r"[A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){0,2}"
+    rank_regex = r"(?:" + "|".join(map(re.escape, rank_words)) + r")"
+    pat_wrong = re.compile(rf"({rank_regex})\s*({name_en})")
+    issues: List[Tuple[str, str, int, int]] = []
+    for m in pat_wrong.finditer(translated):
+        rank, name = m.group(1), m.group(2)
+        issues.append((rank, name, m.start(), m.end()))
+    return issues
+
+def _auto_fix_rank_order(translated: str, rank_words: List[str]) -> str:
+    if not translated:
+        return translated
+    name_en = r"[A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){0,2}"
+    rank_regex = r"(?:" + "|".join(map(re.escape, rank_words)) + r")"
+    pat_wrong = re.compile(rf"\b({rank_regex})\s+({name_en})\b")
+    return pat_wrong.sub(r"\2 \1", translated)
+
+def _glossary_coverage(english: str, translated: str, merged: pd.DataFrame) -> pd.DataFrame:
+    """基于英文原文命中项核对译文是否包含相应 target。返回缺失清单。"""
+    if not english or merged is None or merged.empty:
+        return pd.DataFrame(columns=["source", "target", "type", "found_in_translation"])
+    gdf = build_patterns(merged.drop(columns=["pattern"], errors="ignore"))
+    hits = find_hits(english, gdf) or []
+    dedup = {}
+    for h in hits:
+        if h.term not in dedup:
+            dedup[h.term] = h
+    records = []
+    t = translated or ""
+    for term, _h in dedup.items():
+        rows = merged[merged["source"] == term]
+        if rows.empty:
+            continue
+        any_found = False
+        for _, r in rows.iterrows():
+            tgt = str(r.get("target") or "").strip()
+            if not tgt:
+                continue
+            if tgt in t:
+                any_found = True
+                break
+        records.append({
+            "source": term,
+            "target": "; ".join(rows["target"].astype(str).tolist()),
+            "type": rows.iloc[0].get("type"),
+            "found_in_translation": bool(any_found),
+        })
+    df = pd.DataFrame.from_records(records)
+    if not df.empty:
+        df = df.sort_values(["found_in_translation", "type", "source"], ascending=[True, True, True])
+    return df
 
 # =============================
 # Streamlit UI
@@ -149,7 +253,7 @@ api_key = st.sidebar.text_input(
     "OpenAI API Key", type="password", help="仅当前会话使用；留空则尝试使用环境变量 OPENAI_API_KEY"
 )
 
-pricing: dict[str, dict[str, float]] = {}
+pricing: Dict[str, Dict[str, float]] = {}
 for m in ["gpt-5-mini", "gpt-5"]:
     col1, col2 = st.sidebar.columns(2)
     with col1:
@@ -160,14 +264,15 @@ for m in ["gpt-5-mini", "gpt-5"]:
 
 out_multiplier = st.sidebar.slider("输出token/输入比例", 1.05, 1.30, 1.10, 0.01)
 
-st.title("🖖 星际迷航翻译助手：单章 + 批量")
+st.title("🖖 星际迷航翻译助手：单章 + 批量 + 质检")
 
 # Tabs
-T1, T2, T3, T4 = st.tabs([
+T1, T2, T3, T4, T5 = st.tabs([
     "① 粘贴整章估价",
     "② 术语/多语料库管理",
     "③ 规则与系统提示",
     "④ 批处理/JSONL 生成",
+    "⑤ 成品质检/修复",
 ])
 
 # Tab1: 估价
@@ -330,7 +435,7 @@ with T3:
         hits = find_hits(chapter_text, gdf)
         hit_terms = sorted({h.term for h in hits})
         glossary_subset = merged[merged["source"].isin(hit_terms)].copy() if hit_terms else merged.head(50).copy()
-        names: list[str] = []  # 人名由提示词自检测
+        names: List[str] = []  # 人名由提示词自检测
         sys_prompt = build_system_prompt(rules, glossary_subset.drop(columns=["pattern"], errors="ignore"), names)
 
         st.markdown("**系统提示（用于调用翻译）**")
@@ -399,13 +504,13 @@ with T4:
             corpora = st.session_state.get("corpora", {})
             merged = merge_corpora(corpora)
             gdf = build_patterns(merged.drop(columns=["pattern"], errors="ignore"))
-            rows: list[dict] = []
+            rows: List[dict] = []
             for it in chs:
                 text = it["text"]
                 hits = find_hits(text, gdf)
                 terms = sorted({h.term for h in hits})
                 subset = merged[merged["source"].isin(terms)].copy() if terms else merged.head(50).copy()
-                names: list[str] = []  # 人名由提示词自检测
+                names: List[str] = []  # 人名由提示词自检测
                 system_prompt = build_system_prompt(rules, subset.drop(columns=["pattern"], errors="ignore"), names)
                 rows.append({"id": it["id"], "system_prompt": system_prompt, "user_text": text})
             adapter = Translator(model, api_key=api_key)
@@ -479,3 +584,115 @@ with T4:
                 st.download_button("下载所有章节（ZIP）", data=zip_bytes, file_name="batch_outputs.zip")
             except Exception as e:
                 st.error(f"解析失败：{e}")
+
+# Tab5: 成品质检/修复
+with T5:
+    st.subheader("对已翻译 TXT 做一致性质检与快速修复")
+    st.caption("检查点：① 术语覆盖（英文原文命中 → 译文是否包含 target）；② 军衔顺序（应为“名字 在前，军衔 在后”）；③ 段落空行（段落间至少一个空行）。")
+
+    # —— 上传区：用 getvalue()，避免被 .read() 消耗后为空 ——
+    colL, colR = st.columns(2)
+    with colL:
+        en_up = st.file_uploader("上传英文原文 TXT（用于术语命中）", type=["txt"], key="qc_en")
+    with colR:
+        zh_up = st.file_uploader("上传中文译文 TXT（待质检/修复）", type=["txt"], key="qc_zh")
+
+    # —— 取会话内语料，合并并收集军衔词表 ——
+    corpora = st.session_state.get("corpora", {})
+    merged = _merge_corpora_for_check(corpora)
+    ranks = _collect_rank_words(merged)
+
+    # —— 从上传组件读文本（持久化到 session_state，避免因重跑丢失） ——
+    if en_up:
+        st.session_state["qc_en_text"] = en_up.getvalue().decode("utf-8", errors="ignore")
+    if zh_up:
+        st.session_state["qc_zh_text"] = zh_up.getvalue().decode("utf-8", errors="ignore")
+
+    en_text = st.session_state.get("qc_en_text", "")
+    zh_text = st.session_state.get("qc_zh_text", "")
+
+    # —— 质检按钮：把结果写入 session_state —— 
+    if st.button("开始质检", disabled=not (en_text and zh_text)):
+        cov_df = _glossary_coverage(en_text, zh_text, merged)
+        issues = _find_rank_order_issues(zh_text, ranks)
+        fixed_para = _normalize_paragraphs(zh_text)
+
+        st.session_state["qc_cov_df"] = cov_df
+        st.session_state["qc_issues"] = issues
+        st.session_state["qc_fixed_para"] = fixed_para
+        st.session_state["qc_ranks"] = ranks
+
+        st.success("质检完成（结果已缓存，可在下方查看/修复）。")
+
+    # —— 展示质检结果：从 session_state 读取 —— 
+    cov_df = st.session_state.get("qc_cov_df", None)
+    issues = st.session_state.get("qc_issues", None)
+    fixed_para = st.session_state.get("qc_fixed_para", None)
+    ranks_cached = st.session_state.get("qc_ranks", ranks)
+
+    st.markdown("### 术语覆盖报告")
+    if cov_df is None:
+        st.info("请先点击“开始质检”。")
+    else:
+        missing_df = cov_df[cov_df["found_in_translation"] == False] if not cov_df.empty else pd.DataFrame(columns=cov_df.columns)
+        if cov_df.empty:
+            st.info("未识别到任何术语命中，或语料库为空。")
+        else:
+            st.dataframe(cov_df, use_container_width=True, height=260)
+            st.download_button("下载覆盖报告 CSV", cov_df.to_csv(index=False).encode("utf-8"), file_name="coverage_report.csv")
+        if missing_df is not None and not missing_df.empty:
+            st.warning(f"缺失 {len(missing_df)} 项译名未出现在译文中（建议人工复核或二次替换）。")
+        else:
+            st.success("未发现遗漏词条（或无法判断）。")
+
+    st.markdown("### 军衔顺序检查（应为“名字 在前，军衔 在后”）")
+    if issues is None:
+        st.info("请先点击“开始质检”。")
+    else:
+        if not issues:
+            st.success("未发现军衔在前、名字在后的违例。")
+        else:
+            preview_rows = []
+            for rk, nm, a, b in issues[:200]:
+                snippet = zh_text[max(0, a - 20):min(len(zh_text), b + 20)].replace("\n", " ")
+                preview_rows.append({"rank": rk, "name": nm, "context": snippet})
+            st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, height=220)
+            st.caption(f"共发现 {len(issues)} 处。")
+
+    st.markdown("### 段落空行")
+    if fixed_para is None:
+        st.info("请先点击“开始质检”。")
+    else:
+        if fixed_para != zh_text:
+            st.info("检测到段落空行问题，已生成修复版本（预览在下载文件中）。")
+        else:
+            st.success("段落空行看起来正常。")
+
+    st.markdown("---")
+    st.subheader("一键修复（可选）")
+
+    # —— 把复选框的值放进 session_state，避免点击后重跑丢失 —— 
+    st.checkbox("自动把 ‘军衔 名字’ 互换为 ‘名字 军衔’（仅英文名字场景）", key="qc_do_swap", value=False)
+
+    # —— 文件名输入放在按钮外，避免重跑丢失 —— 
+    fix_filename = st.text_input("保存文件名", value="translated_fixed.txt", key="qc_fix_filename")
+
+    # —— 应用修复按钮：根据 session_state 生成下载内容 —— 
+    apply_disabled = fixed_para is None  # 还没质检就不能修复
+    if st.button("应用修复并下载 TXT", disabled=apply_disabled):
+        # 重新读取最新的 fixed_para/issues（来自 session_state）
+        fixed_para = st.session_state.get("qc_fixed_para", "")
+        issues = st.session_state.get("qc_issues", [])
+        ranks_cached = st.session_state.get("qc_ranks", ranks)
+        out_txt = fixed_para or zh_text
+
+        if st.session_state.get("qc_do_swap", False) and issues:
+            out_txt = _auto_fix_rank_order(out_txt, ranks_cached)
+
+        # 用 download_button 输出文件内容（按钮要在同一帧渲染时拿到数据）
+        st.download_button(
+            "下载修复后 TXT",
+            data=out_txt.encode("utf-8"),
+            file_name=st.session_state.get("qc_fix_filename", "translated_fixed.txt"),
+            mime="text/plain",
+        )
