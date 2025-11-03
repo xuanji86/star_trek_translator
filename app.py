@@ -320,7 +320,7 @@ with T3:
         # 轻量 QC
         rep = quick_qc(len(hits), len(names))
         with st.expander("快速质量检查"):
-            st.json({"glossary_hits": rep.glossary_hits, "names_detected": rep.names_detected, "violations": rep.violations})
+            st.json({"glossary_hits": rep.glossary_hits, "violations": rep.violations})
 
         # 单次调用（实际调用）
         temp = 1.0
