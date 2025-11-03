@@ -122,8 +122,9 @@ $ python3 -m streamlit run app.py
 
 ## 🧾 License / 许可证
 
-MIT License – Free for academic and non-commercial use.
-MIT 开源许可 – 免费用于科研与非商业用途。
+GPL v3 License – Free to use, modify, and distribute under the same license.
+GPL v3 开源许可 – 允许自由使用、修改与再分发，但需保持相同许可条款。
+
 
 ---
 
