@@ -1,16 +1,23 @@
 import os
+import io
+import re
 import math
+import zipfile
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
-import re
+from openai import OpenAI
+from typing import Optional, Dict, List, Tuple  # 添加 Tuple
 
 from core.tokenizer import estimate_tokens
 from core.pricing import DEFAULT_PRICING, estimate_cost
 from core.glossary import (
-    load_glossary_csv, build_patterns, find_hits,
-    normalize_glossary_df, merge_corpora,
+    load_glossary_csv,
+    build_patterns,
+    find_hits,
+    normalize_glossary_df,
+    merge_corpora,
 )
 from core.rules import parse_rules_yaml
 from core.prompts import build_system_prompt
@@ -18,128 +25,257 @@ from core.qc import quick_qc
 from core.translator import Translator
 from core.batching import chapters_from_folder, build_batch_jsonl
 
-# ===== 分段翻译辅助函数 =====
+# =============================
+# 分段翻译辅助函数
+# =============================
+
 def _normalize_newlines(text: str) -> str:
-    # 统一换行，避免 Windows/Mac 不同换行导致分割异常
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
-def _safe_paragraphs(text: str) -> list[str]:
-    """
-    优先按“≥2个换行”切段；若切不动，再退化为按句号/问号/感叹号切句；
-    再不行，最后按固定长度兜底，避免任何空分隔符错误。
-    """
+def _safe_paragraphs(text: str) -> List[str]:
     t = _normalize_newlines(text)
     paras = [p.strip() for p in re.split(r"\n{2,}", t) if p and p.strip()]
     if paras:
         return paras
-
-    # 没有空行就按句子切
     sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", t) if s and s.strip()]
     if sents:
         return sents
-
-    # 仍然切不出来（极端长段），按固定字符宽度兜底
     CHUNK = 1200
     t = t.strip()
     if not t:
         return []
-    return [t[i:i+CHUNK] for i in range(0, len(t), CHUNK)]
+    return [t[i : i + CHUNK] for i in range(0, len(t), CHUNK)]
 
 def split_text_by_tokens(text: str, model: str, max_input_tokens: int = 6000):
-    """
-    近似按 tokens 切分：以“段/句/定长兜底”为单位累积，超过预算就切块。
-    - max_input_tokens 要为系统提示与输出留余量；<1000 时自动抬到 1000 以防极端设置。
-    """
     if not isinstance(text, str) or not text.strip():
         return
     budget = max(1000, int(max_input_tokens or 6000))
-
     units = _safe_paragraphs(text)
-    buf, buf_tokens = [], 0
+    buf: List[str] = []
+    buf_tokens = 0
     for u in units:
         t = estimate_tokens(u, model)
-        # 单个 unit 超过预算：直接作为独立块（避免死循环）
         if t >= budget:
             if buf:
                 yield "\n\n".join(buf)
                 buf, buf_tokens = [], 0
             yield u
             continue
-
-        # 正常累积
         if buf and buf_tokens + t > budget:
             yield "\n\n".join(buf)
             buf, buf_tokens = [u], t
         else:
             buf.append(u)
             buf_tokens += t
-
     if buf:
         yield "\n\n".join(buf)
 
-def translate_full_text(adapter, system_prompt: str, text: str, model: str,
+def translate_full_text(adapter: Translator, system_prompt: str, text: str, model: str,
                         max_input_tokens: int = 6000) -> str:
-    """
-    分段翻译整章并拼接；失败时抛异常，由上层 UI 捕获。
-    """
     chunks = list(split_text_by_tokens(text, model, max_input_tokens=max_input_tokens))
     if not chunks:
         return ""
-    outputs = []
+    outputs: List[str] = []
     for i, ck in enumerate(chunks, 1):
         st.info(f"翻译分段 {i}/{len(chunks)}…")
         res = adapter.translate_once(system_prompt=system_prompt, user_text=ck)
         outputs.append((res.text or "").strip())
     return "\n\n".join([o for o in outputs if o]).strip()
 
+# =============================
+# Batch API 辅助函数
+# =============================
+
+def _make_client_from_gui(api_key: Optional[str]) -> OpenAI:
+    if api_key and api_key.strip():
+        return OpenAI(api_key=api_key.strip())
+    return OpenAI()
+
+def _save_results_jsonl_bytes(client: OpenAI, file_id: str, out_path: Path) -> None:
+    content: bytes = client.files.content(file_id).content
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(content)
+
+def _parse_results_jsonl(jsonl_path: Path) -> List[dict]:
+    results: List[dict] = []
+    if not jsonl_path.exists():
+        return results
+    for line in jsonl_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            obj = __import__("json").loads(line)
+        except Exception:
+            continue
+        cid = obj.get("custom_id")
+        body = obj.get("response", {}).get("body", {})
+        try:
+            text = body["choices"][0]["message"]["content"]
+        except Exception:
+            text = ""
+        results.append({"custom_id": cid, "text": text, "raw": body})
+    return results
+
+def _write_txt_outputs(results: List[dict], out_dir: Path) -> List[Path]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    paths: List[Path] = []
+    for r in results:
+        cid = (r.get("custom_id") or "unknown").replace("/", "_")
+        p = out_dir / f"{cid}.txt"
+        p.write_text(r.get("text") or "", encoding="utf-8")
+        paths.append(p)
+    return paths
+
+def _zip_paths(paths: List[Path]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for p in paths:
+            zf.write(p, arcname=p.name)
+    buf.seek(0)
+    return buf.read()
+
+# =============================
+# 质检与修复辅助函数
+# =============================
+
+def _merge_corpora_for_check(corpora: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    try:
+        return merge_corpora(corpora)
+    except Exception:
+        frames = []
+        for name, df in (corpora or {}).items():
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                tmp = df.copy()
+                if "corpus" not in tmp.columns:
+                    tmp["corpus"] = name
+                frames.append(tmp)
+        if not frames:
+            return pd.DataFrame(columns=["source", "target", "type", "note", "corpus"])
+        out = pd.concat(frames, ignore_index=True)
+        out = out.drop_duplicates(subset=["source", "target", "type"], keep="first")
+        return out
+
+def _collect_rank_words(merged: pd.DataFrame) -> List[str]:
+    if merged is None or merged.empty:
+        return ["上校", "中校", "少校", "上尉", "中尉", "少尉", "舰长"]
+    # 只取 type == rank 的 target
+    try:
+        ranks = merged[merged["type"] == "rank"]["target"].dropna().astype(str).tolist()
+    except Exception:
+        ranks = []
+    ranks = sorted({r.strip() for r in ranks if r.strip()}, key=len, reverse=True)
+    return ranks or ["上校", "中校", "少校", "上尉", "中尉", "少尉", "舰长"]
+
+def _normalize_paragraphs(txt: str) -> str:
+    if not isinstance(txt, str):
+        return ""
+    t = txt.replace("\r\n", "\n").replace("\r", "\n")
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    lines = [ln.rstrip() for ln in t.split("\n")]
+    fixed: List[str] = []
+    for i, ln in enumerate(lines):
+        fixed.append(ln)
+        if ln.strip() and i + 1 < len(lines) and lines[i + 1].strip():
+            fixed.append("")
+    t = "\n".join(fixed)
+    t = t.strip("\n")
+    t = re.sub(r"(\n)\s*(\n)", "\n\n", t)
+    return t
+
+def _find_rank_order_issues(translated: str, rank_words: List[str]) -> List[Tuple[str, str, int, int]]:
+    """检测到 “军衔 在前、名字 在后”的违例，返回 (rank, name, start, end)。"""
+    if not translated:
+        return []
+    name_en = r"[A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){0,2}"
+    rank_regex = r"(?:" + "|".join(map(re.escape, rank_words)) + r")"
+    pat_wrong = re.compile(rf"({rank_regex})\s*({name_en})")
+    issues: List[Tuple[str, str, int, int]] = []
+    for m in pat_wrong.finditer(translated):
+        rank, name = m.group(1), m.group(2)
+        issues.append((rank, name, m.start(), m.end()))
+    return issues
+
+def _auto_fix_rank_order(translated: str, rank_words: List[str]) -> str:
+    if not translated:
+        return translated
+    name_en = r"[A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){0,2}"
+    rank_regex = r"(?:" + "|".join(map(re.escape, rank_words)) + r")"
+    pat_wrong = re.compile(rf"\b({rank_regex})\s+({name_en})\b")
+    return pat_wrong.sub(r"\2 \1", translated)
+
+def _glossary_coverage(english: str, translated: str, merged: pd.DataFrame) -> pd.DataFrame:
+    """基于英文原文命中项核对译文是否包含相应 target。返回缺失清单。"""
+    if not english or merged is None or merged.empty:
+        return pd.DataFrame(columns=["source", "target", "type", "found_in_translation"])
+    gdf = build_patterns(merged.drop(columns=["pattern"], errors="ignore"))
+    hits = find_hits(english, gdf) or []
+    dedup = {}
+    for h in hits:
+        if h.term not in dedup:
+            dedup[h.term] = h
+    records = []
+    t = translated or ""
+    for term, _h in dedup.items():
+        rows = merged[merged["source"] == term]
+        if rows.empty:
+            continue
+        any_found = False
+        for _, r in rows.iterrows():
+            tgt = str(r.get("target") or "").strip()
+            if not tgt:
+                continue
+            if tgt in t:
+                any_found = True
+                break
+        records.append({
+            "source": term,
+            "target": "; ".join(rows["target"].astype(str).tolist()),
+            "type": rows.iloc[0].get("type"),
+            "found_in_translation": bool(any_found),
+        })
+    df = pd.DataFrame.from_records(records)
+    if not df.empty:
+        df = df.sort_values(["found_in_translation", "type", "source"], ascending=[True, True, True])
+    return df
+
+# =============================
+# Streamlit UI
+# =============================
+
 st.set_page_config(page_title="Star Trek 翻译助手 · GUI & Batch", layout="wide")
 
-# ===== Sidebar: 基本设置 =====
+# Sidebar
 st.sidebar.header("设置")
 model = st.sidebar.selectbox("选择模型", ["gpt-5-mini", "gpt-5"], index=0)
 batch_mode = st.sidebar.checkbox("Batch API（约 -20% 成本）", value=True)
 batch_discount = 0.20 if batch_mode else 0.0
-
-# 仅会话内存储，不落盘
 api_key = st.sidebar.text_input(
     "OpenAI API Key", type="password", help="仅当前会话使用；留空则尝试使用环境变量 OPENAI_API_KEY"
 )
 
-# 计价设置
-pricing = {}
+pricing: Dict[str, Dict[str, float]] = {}
 for m in ["gpt-5-mini", "gpt-5"]:
     col1, col2 = st.sidebar.columns(2)
     with col1:
-        pi = st.number_input(
-            f"{m} 输入($/1M)",
-            value=float(DEFAULT_PRICING[m]["input"]),
-            min_value=0.0,
-            step=0.05,
-            key=f"pi_{m}",
-        )
+        pi = st.number_input(f"{m} 输入($/1M)", value=float(DEFAULT_PRICING[m]["input"]), min_value=0.0, step=0.05, key=f"pi_{m}")
     with col2:
-        po = st.number_input(
-            f"{m} 输出($/1M)",
-            value=float(DEFAULT_PRICING[m]["output"]),
-            min_value=0.0,
-            step=0.10,
-            key=f"po_{m}",
-        )
+        po = st.number_input(f"{m} 输出($/1M)", value=float(DEFAULT_PRICING[m]["output"]), min_value=0.0, step=0.10, key=f"po_{m}")
     pricing[m] = {"input": pi, "output": po}
 
 out_multiplier = st.sidebar.slider("输出token/输入比例", 1.05, 1.30, 1.10, 0.01)
 
-st.title("🖖 星际迷航翻译助手：单章+ 批量翻译")
+st.title("🖖 星际迷航翻译助手：单章 + 批量 + 质检")
 
-# ===== Tabs =====
-T1, T2, T3, T4 = st.tabs([
+# Tabs
+T1, T2, T3, T4, T5 = st.tabs([
     "① 粘贴整章估价",
     "② 术语/多语料库管理",
     "③ 规则与系统提示",
     "④ 批处理/JSONL 生成",
+    "⑤ 成品质检/修复",
 ])
 
-# --- Tab1: 估价 ---
+# Tab1: 估价
 with T1:
     st.subheader("整章英文内容")
     chapter_text = st.text_area("粘贴英文原文：", height=300, placeholder="Paste chapter text here…")
@@ -156,44 +292,40 @@ with T1:
             c3.metric("预计成本(USD)", f"{cb.total_cost:.2f}")
             st.caption(f"模型：{model} · Batch：{'ON' if batch_mode else 'OFF'} · 输出倍率：{out_multiplier:.2f}")
 
-# --- Tab2: 多语料库管理 ---
+# Tab2: 多语料库管理
 with T2:
     st.subheader("多语料库（可扩展）：舰船/物种/职位/物品…")
 
-    # 初始化会话态：{'base': df, 'ships': df, ...}
     if "corpora" not in st.session_state:
         sample_path = Path("data/glossary_sample.csv")
         fallback_df = (
             pd.read_csv(sample_path)
             if sample_path.exists()
             else pd.DataFrame([
-                {"source":"U.S.S. Enterprise","target":"联邦星舰企业号","type":"ship","note":"舰名翻译"},
-                {"source":"Enterprise","target":"企业号","type":"ship","note":"舰名翻译"},
-                {"source":"U.S.S. Titan","target":"联邦星舰泰坦号","type":"ship","note":"舰名翻译"},
-                {"source":"Titan","target":"泰坦号","type":"ship","note":"舰名翻译"},
-                {"source":"U.S.S. Aventine","target":"联邦星舰安文婷号","type":"ship","note":"舰名翻译"},
-                {"source":"Aventine","target":"安文婷号","type":"ship","note":"舰名翻译"},
-                {"source":"Borg","target":"博格","type":"species","note":"物种"},
-                {"source":"Borg drone","target":"博格个体","type":"species","note":"个体称谓（按物种归类）"},
-                {"source":"Starfleet","target":"星际舰队","type":"org","note":""},
-                {"source":"Captain","target":"上校","type":"rank","note":""},
-                {"source":"Commander","target":"中校","type":"rank","note":""},
-                {"source":"Lieutenant Commander","target":"少校","type":"rank","note":""},
-                {"source":"Operations manager","target":"操作官","type":"role","note":""},
-                {"source":"Security chief","target":"安全官","type":"role","note":""},
-                {"source":"Flight controller","target":"舵手","type":"role","note":""},
-                {"source":"Number One","target":"大副","type":"role","note":""},
-                {"source":"Chief engineer","target":"轮机长","type":"role","note":""},
-                {"source":"turbolift","target":"涡轮电梯","type":"item","note":""},
+                {"source": "U.S.S. Enterprise", "target": "联邦星舰企业号", "type": "ship", "note": "舰名翻译"},
+                {"source": "Enterprise", "target": "企业号", "type": "ship", "note": "舰名翻译"},
+                {"source": "U.S.S. Titan", "target": "联邦星舰泰坦号", "type": "ship", "note": "舰名翻译"},
+                {"source": "Titan", "target": "泰坦号", "type": "ship", "note": "舰名翻译"},
+                {"source": "U.S.S. Aventine", "target": "联邦星舰安文婷号", "type": "ship", "note": "舰名翻译"},
+                {"source": "Aventine", "target": "安文婷号", "type": "ship", "note": "舰名翻译"},
+                {"source": "Borg", "target": "博格", "type": "species", "note": "物种"},
+                {"source": "Borg drone", "target": "博格个体", "type": "species", "note": "个体称谓（按物种归类）"},
+                {"source": "Starfleet", "target": "星际舰队", "type": "org", "note": ""},
+                {"source": "Captain", "target": "上校", "type": "rank", "note": ""},
+                {"source": "Commander", "target": "中校", "type": "rank", "note": ""},
+                {"source": "Lieutenant Commander", "target": "少校", "type": "rank", "note": ""},
+                {"source": "Operations manager", "target": "操作官", "type": "role", "note": ""},
+                {"source": "Security chief", "target": "安全官", "type": "role", "note": ""},
+                {"source": "Flight controller", "target": "舵手", "type": "role", "note": ""},
+                {"source": "Number One", "target": "大副", "type": "role", "note": ""},
+                {"source": "Chief engineer", "target": "轮机长", "type": "role", "note": ""},
+                {"source": "turbolift", "target": "涡轮电梯", "type": "item", "note": ""},
             ])
         )
-        st.session_state["corpora"] = {
-            "base": normalize_glossary_df(fallback_df, corpus_name="base")
-        }
+        st.session_state["corpora"] = {"base": normalize_glossary_df(fallback_df, corpus_name="base")}
 
     corpora = st.session_state["corpora"]
 
-    # 从目录批量导入 *.csv 为多个语料库
     st.markdown("**从目录批量导入 CSV**（每个 CSV 视为一个语料库，文件名为语料库名）")
     colA, colB = st.columns([2, 1])
     with colA:
@@ -215,7 +347,6 @@ with T2:
             else:
                 st.error("目录不存在。")
 
-    # 单文件新增语料库（可多次上传）
     st.markdown("**上传 CSV 新增语料库**（字段: source,target,type,note）")
     up_files = st.file_uploader("选择一个或多个 CSV", type=["csv"], accept_multiple_files=True)
     if up_files:
@@ -228,7 +359,6 @@ with T2:
                 st.warning(f"跳过 {uf.name}: {e}")
         st.success(f"已添加 {len(up_files)} 个语料库到会话。")
 
-    # 新建空白语料库
     with st.expander("➕ 新建空白语料库", expanded=False):
         new_name = st.text_input("语料库名称", placeholder="例如 ships/species/roles/items 或任意自定义")
         if st.button("创建空白语料库"):
@@ -243,12 +373,10 @@ with T2:
                 )
                 st.success(f"已创建：{new_name}")
 
-    # 选择并编辑某个语料库
     st.markdown("**编辑语料库**")
     corpus_names = sorted(corpora.keys())
     sel = st.selectbox("选择语料库", corpus_names, index=corpus_names.index("base") if "base" in corpus_names else 0)
-    cur_df = corpora[sel].copy()
-    cur_df = cur_df.drop(columns=["pattern"], errors="ignore")  # 展示时去掉编译列
+    cur_df = corpora[sel].copy().drop(columns=["pattern"], errors="ignore")
     st.dataframe(cur_df, use_container_width=True, height=240)
 
     with st.expander("✍️ 就地编辑并保存", expanded=False):
@@ -257,7 +385,7 @@ with T2:
             num_rows="dynamic",
             use_container_width=True,
             height=300,
-            column_config={"source":"英文", "target":"中文", "type":"类别", "note":"备注", "corpus":"语料库"},
+            column_config={"source": "英文", "target": "中文", "type": "类别", "note": "备注", "corpus": "语料库"},
         )
         c1, c2, c3, c4 = st.columns(4)
         if c1.button("保存到当前语料库"):
@@ -275,13 +403,11 @@ with T2:
         with c4:
             st.caption("type 常见: ship/species/role/rank/item/org/place/tech…")
 
-    # 合并视图
     merged = merge_corpora(corpora)
     st.markdown("**合并总览（仅展示，不含编译列）**")
     st.dataframe(merged.drop(columns=["pattern"], errors="ignore"), use_container_width=True, height=260)
 
-    # 命中分析（基于合并语料库）
-    if 'chapter_text' not in locals() or not chapter_text.strip():
+    if not chapter_text or not chapter_text.strip():
         st.info("Tab1 粘贴文本后，这里可做术语命中分析。")
     else:
         gdf = build_patterns(merged.drop(columns=["pattern"], errors="ignore"))
@@ -293,7 +419,7 @@ with T2:
         else:
             st.caption("未检测到术语命中。")
 
-# --- Tab3: 规则与系统提示 + 单次调用 ---
+# Tab3: 规则与系统提示 + 调用
 with T3:
     st.subheader("翻译规则 (YAML)")
     rules_path = Path("data/rules_sample.yaml")
@@ -302,27 +428,23 @@ with T3:
     rules = parse_rules_yaml(rules_text)
     st.caption("这些规则将注入系统提示，强制人名不翻、舰名/军衔/职位/物种/物品等统一译名。")
 
-    if 'chapter_text' in locals() and chapter_text.strip():
-        corpora = st.session_state.get('corpora', {})
+    if chapter_text and chapter_text.strip():
+        corpora = st.session_state.get("corpora", {})
         merged = merge_corpora(corpora)
         gdf = build_patterns(merged.drop(columns=["pattern"], errors="ignore"))
         hits = find_hits(chapter_text, gdf)
         hit_terms = sorted({h.term for h in hits})
-        glossary_subset = merged[merged['source'].isin(hit_terms)].copy() if hit_terms else merged.head(50).copy()
+        glossary_subset = merged[merged["source"].isin(hit_terms)].copy() if hit_terms else merged.head(50).copy()
+        names: List[str] = []  # 人名由提示词自检测
+        sys_prompt = build_system_prompt(rules, glossary_subset.drop(columns=["pattern"], errors="ignore"), names)
 
-        # 人名由提示词自检测，不再传名单
-        names = []
-
-        sys_prompt = build_system_prompt(rules, glossary_subset.drop(columns=["pattern"], errors='ignore'), names)
         st.markdown("**系统提示（用于调用翻译）**")
         st.code(sys_prompt, language="json")
 
-        # 轻量 QC
         rep = quick_qc(len(hits), len(names))
         with st.expander("快速质量检查"):
-            st.json({"glossary_hits": rep.glossary_hits, "violations": rep.violations})
+            st.json({"glossary_hits": rep.glossary_hits, "names_detected": rep.names_detected, "violations": rep.violations})
 
-        # 单次调用（实际调用）
         temp = 1.0
         st.caption("temperature 已固定为 1（该模型仅支持默认值）。")
         max_toks = st.number_input("max_output_tokens(可选)", value=0, min_value=0, step=50, help="0 表示不限制")
@@ -333,7 +455,7 @@ with T3:
 
         disabled = not (api_key or os.getenv("OPENAI_API_KEY"))
         if st.button("试运行翻译", type="secondary", disabled=disabled):
-            adapter = Translator(model, temperature=temp, max_output_tokens=(None if max_toks==0 else max_toks), response_format=response_format, api_key=api_key)
+            adapter = Translator(model, temperature=temp, max_output_tokens=(None if max_toks == 0 else max_toks), response_format=response_format, api_key=api_key)
             try:
                 result = adapter.translate_once(system_prompt=sys_prompt, user_text=chapter_text[:4000])
                 st.text_area("返回示例", value=result.text, height=220)
@@ -346,29 +468,16 @@ with T3:
         elif disabled:
             st.info("请在左侧输入 OpenAI API Key 或设置环境变量后再试。")
 
-        # —— 整章翻译（自动分段） ——
         st.markdown("---")
         st.subheader("整章翻译（自动分段）")
         st.caption("按 token 预算自动切块，逐段调用并合并为全文；适用于长章节/整章。")
-        max_in_budget = st.number_input(
-            "每段最大输入 tokens（为系统提示与输出留余量）",
-            value=6000, min_value=2000, max_value=24000, step=500
-        )
+        max_in_budget = st.number_input("每段最大输入 tokens（为系统提示与输出留余量）", value=6000, min_value=2000, max_value=24000, step=500)
         full_disabled = disabled or (not chapter_text.strip())
         if st.button("开始整章翻译", type="primary", disabled=full_disabled):
-            adapter = Translator(
-                model,
-                temperature=1.0,
-                max_output_tokens=(None if max_toks == 0 else max_toks),
-                response_format=response_format,
-                api_key=api_key,
-            )
+            adapter = Translator(model, temperature=1.0, max_output_tokens=(None if max_toks == 0 else max_toks), response_format=response_format, api_key=api_key)
             try:
                 with st.spinner("整章翻译进行中…"):
-                    full_text = translate_full_text(
-                        adapter, sys_prompt, chapter_text, model,
-                        max_input_tokens=int(max_in_budget)
-                    )
+                    full_text = translate_full_text(adapter, sys_prompt, chapter_text, model, max_input_tokens=int(max_in_budget))
                 st.success("整章翻译完成 ✅")
                 st.text_area("全文译文（预览）", value=full_text, height=320)
                 fname_full = st.text_input("导出文件名（全文）", value="chapter_translation_full.txt", key="full_fn")
@@ -376,7 +485,7 @@ with T3:
             except Exception as e:
                 st.error(f"整章翻译失败：{e}")
 
-# --- Tab4: 批处理 JSONL ---
+# Tab4: 批处理 JSONL + Batch 流程
 with T4:
     st.subheader("批处理：从文件夹读取章节，生成 Batch JSONL")
     colA, colB = st.columns([2, 1])
@@ -392,27 +501,198 @@ with T4:
         if not chs:
             st.error("未在该路径发现 .txt 章节文件。")
         else:
-            corpora = st.session_state.get('corpora', {})
+            corpora = st.session_state.get("corpora", {})
             merged = merge_corpora(corpora)
             gdf = build_patterns(merged.drop(columns=["pattern"], errors="ignore"))
-            rows = []
+            rows: List[dict] = []
             for it in chs:
                 text = it["text"]
                 hits = find_hits(text, gdf)
                 terms = sorted({h.term for h in hits})
-                subset = merged[merged['source'].isin(terms)].copy() if terms else merged.head(50).copy()
-                names = []  # 人名由提示词自检测
-
+                subset = merged[merged["source"].isin(terms)].copy() if terms else merged.head(50).copy()
+                names: List[str] = []  # 人名由提示词自检测
                 system_prompt = build_system_prompt(rules, subset.drop(columns=["pattern"], errors="ignore"), names)
-                rows.append({
-                    "id": it["id"],
-                    "system_prompt": system_prompt,
-                    "user_text": text,
-                })
+                rows.append({"id": it["id"], "system_prompt": system_prompt, "user_text": text})
             adapter = Translator(model, api_key=api_key)
             jsonl_rows = adapter.prepare_batch_items(rows)
             build_batch_jsonl(jsonl_rows, out_jsonl)
             st.success(f"已生成：{out_jsonl}")
             p = Path(out_jsonl)
             if p.exists():
-                st.code(p.read_text(encoding='utf-8')[:1200] + "...", language="json")
+                st.code(p.read_text(encoding="utf-8")[:1200] + "\n...", language="json")
+
+    st.markdown("---")
+    st.subheader("Batch API 运行：上传 → 创建任务 → 查询 → 下载结果")
+
+    if "batch_state" not in st.session_state:
+        st.session_state["batch_state"] = {"input_file_id": None, "batch_id": None, "output_file_id": None}
+    bstate = st.session_state["batch_state"]
+
+    disabled_batch = not (api_key or os.getenv("OPENAI_API_KEY"))
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("① 上传 JSONL 并创建 Batch 任务", type="primary", disabled=disabled_batch):
+            try:
+                client = _make_client_from_gui(api_key)
+                up = client.files.create(file=open(out_jsonl, "rb"), purpose="batch")
+                bstate["input_file_id"] = up.id
+                job = client.batches.create(input_file_id=up.id, endpoint="/v1/chat/completions", completion_window="24h")
+                bstate["batch_id"] = job.id
+                st.success(f"已创建 Batch：{job.id}")
+                st.json({"batch_id": job.id, "status": job.status, "input_file_id": up.id})
+            except Exception as e:
+                st.error(f"创建失败：{e}")
+    with col2:
+        if st.button("② 查询/刷新状态", disabled=disabled_batch or not bstate.get("batch_id")):
+            try:
+                client = _make_client_from_gui(api_key)
+                job = client.batches.retrieve(bstate["batch_id"])
+                st.info(f"状态：{job.status}")
+                if getattr(job, "output_file_id", None):
+                    bstate["output_file_id"] = job.output_file_id
+                st.json({
+                    "status": job.status,
+                    "request_counts": getattr(job, "request_counts", None) and job.request_counts.model_dump() or {},
+                    "created_at": getattr(job, "created_at", None),
+                    "output_file_id": getattr(job, "output_file_id", None),
+                })
+            except Exception as e:
+                st.error(f"查询失败：{e}")
+
+    st.caption("当状态为 completed 时，可下载结果。结果可能乱序，请使用 custom_id 回绑章节。")
+
+    col3, col4 = st.columns(2)
+    with col3:
+        default_results_path = str(Path.cwd() / "batch" / "results.jsonl")
+        res_path = st.text_input("保存结果 JSONL 到：", value=default_results_path)
+        if st.button("③ 下载结果 JSONL", disabled=disabled_batch or not bstate.get("output_file_id")):
+            try:
+                client = _make_client_from_gui(api_key)
+                _save_results_jsonl_bytes(client, bstate["output_file_id"], Path(res_path))
+                st.success(f"已保存：{res_path}")
+                st.code(Path(res_path).read_text(encoding="utf-8")[:800] + "\n...", language="json")
+            except Exception as e:
+                st.error(f"下载失败：{e}")
+    with col4:
+        out_dir = st.text_input("按 custom_id 输出到目录：", value=str(Path.cwd() / "batch_outputs"))
+        if st.button("④ 解析并导出 TXT", disabled=not Path(res_path).exists()):
+            try:
+                results = _parse_results_jsonl(Path(res_path))
+                paths = _write_txt_outputs(results, Path(out_dir))
+                zip_bytes = _zip_paths(paths)
+                st.success(f"已写入 {len(paths)} 个章节到 {out_dir}")
+                st.download_button("下载所有章节（ZIP）", data=zip_bytes, file_name="batch_outputs.zip")
+            except Exception as e:
+                st.error(f"解析失败：{e}")
+
+# Tab5: 成品质检/修复
+with T5:
+    st.subheader("对已翻译 TXT 做一致性质检与快速修复")
+    st.caption("检查点：① 术语覆盖（英文原文命中 → 译文是否包含 target）；② 军衔顺序（应为“名字 在前，军衔 在后”）；③ 段落空行（段落间至少一个空行）。")
+
+    # —— 上传区：用 getvalue()，避免被 .read() 消耗后为空 ——
+    colL, colR = st.columns(2)
+    with colL:
+        en_up = st.file_uploader("上传英文原文 TXT（用于术语命中）", type=["txt"], key="qc_en")
+    with colR:
+        zh_up = st.file_uploader("上传中文译文 TXT（待质检/修复）", type=["txt"], key="qc_zh")
+
+    # —— 取会话内语料，合并并收集军衔词表 ——
+    corpora = st.session_state.get("corpora", {})
+    merged = _merge_corpora_for_check(corpora)
+    ranks = _collect_rank_words(merged)
+
+    # —— 从上传组件读文本（持久化到 session_state，避免因重跑丢失） ——
+    if en_up:
+        st.session_state["qc_en_text"] = en_up.getvalue().decode("utf-8", errors="ignore")
+    if zh_up:
+        st.session_state["qc_zh_text"] = zh_up.getvalue().decode("utf-8", errors="ignore")
+
+    en_text = st.session_state.get("qc_en_text", "")
+    zh_text = st.session_state.get("qc_zh_text", "")
+
+    # —— 质检按钮：把结果写入 session_state —— 
+    if st.button("开始质检", disabled=not (en_text and zh_text)):
+        cov_df = _glossary_coverage(en_text, zh_text, merged)
+        issues = _find_rank_order_issues(zh_text, ranks)
+        fixed_para = _normalize_paragraphs(zh_text)
+
+        st.session_state["qc_cov_df"] = cov_df
+        st.session_state["qc_issues"] = issues
+        st.session_state["qc_fixed_para"] = fixed_para
+        st.session_state["qc_ranks"] = ranks
+
+        st.success("质检完成（结果已缓存，可在下方查看/修复）。")
+
+    # —— 展示质检结果：从 session_state 读取 —— 
+    cov_df = st.session_state.get("qc_cov_df", None)
+    issues = st.session_state.get("qc_issues", None)
+    fixed_para = st.session_state.get("qc_fixed_para", None)
+    ranks_cached = st.session_state.get("qc_ranks", ranks)
+
+    st.markdown("### 术语覆盖报告")
+    if cov_df is None:
+        st.info("请先点击“开始质检”。")
+    else:
+        missing_df = cov_df[cov_df["found_in_translation"] == False] if not cov_df.empty else pd.DataFrame(columns=cov_df.columns)
+        if cov_df.empty:
+            st.info("未识别到任何术语命中，或语料库为空。")
+        else:
+            st.dataframe(cov_df, use_container_width=True, height=260)
+            st.download_button("下载覆盖报告 CSV", cov_df.to_csv(index=False).encode("utf-8"), file_name="coverage_report.csv")
+        if missing_df is not None and not missing_df.empty:
+            st.warning(f"缺失 {len(missing_df)} 项译名未出现在译文中（建议人工复核或二次替换）。")
+        else:
+            st.success("未发现遗漏词条（或无法判断）。")
+
+    st.markdown("### 军衔顺序检查（应为“名字 在前，军衔 在后”）")
+    if issues is None:
+        st.info("请先点击“开始质检”。")
+    else:
+        if not issues:
+            st.success("未发现军衔在前、名字在后的违例。")
+        else:
+            preview_rows = []
+            for rk, nm, a, b in issues[:200]:
+                snippet = zh_text[max(0, a - 20):min(len(zh_text), b + 20)].replace("\n", " ")
+                preview_rows.append({"rank": rk, "name": nm, "context": snippet})
+            st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, height=220)
+            st.caption(f"共发现 {len(issues)} 处。")
+
+    st.markdown("### 段落空行")
+    if fixed_para is None:
+        st.info("请先点击“开始质检”。")
+    else:
+        if fixed_para != zh_text:
+            st.info("检测到段落空行问题，已生成修复版本（预览在下载文件中）。")
+        else:
+            st.success("段落空行看起来正常。")
+
+    st.markdown("---")
+    st.subheader("一键修复（可选）")
+
+    # —— 把复选框的值放进 session_state，避免点击后重跑丢失 —— 
+    st.checkbox("自动把 ‘军衔 名字’ 互换为 ‘名字 军衔’（仅英文名字场景）", key="qc_do_swap", value=False)
+
+    # —— 文件名输入放在按钮外，避免重跑丢失 —— 
+    fix_filename = st.text_input("保存文件名", value="translated_fixed.txt", key="qc_fix_filename")
+
+    # —— 应用修复按钮：根据 session_state 生成下载内容 —— 
+    apply_disabled = fixed_para is None  # 还没质检就不能修复
+    if st.button("应用修复并下载 TXT", disabled=apply_disabled):
+        # 重新读取最新的 fixed_para/issues（来自 session_state）
+        fixed_para = st.session_state.get("qc_fixed_para", "")
+        issues = st.session_state.get("qc_issues", [])
+        ranks_cached = st.session_state.get("qc_ranks", ranks)
+        out_txt = fixed_para or zh_text
+
+        if st.session_state.get("qc_do_swap", False) and issues:
+            out_txt = _auto_fix_rank_order(out_txt, ranks_cached)
+
+        # 用 download_button 输出文件内容（按钮要在同一帧渲染时拿到数据）
+        st.download_button(
+            "下载修复后 TXT",
+            data=out_txt.encode("utf-8"),
+            file_name=st.session_state.get("qc_fix_filename", "translated_fixed.txt"),
+            mime="text/plain",
+        )
