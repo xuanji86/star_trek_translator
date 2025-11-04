@@ -204,40 +204,99 @@ def _auto_fix_rank_order(translated: str, rank_words: List[str]) -> str:
     return pat_wrong.sub(r"\2 \1", translated)
 
 def _glossary_coverage(english: str, translated: str, merged: pd.DataFrame) -> pd.DataFrame:
-    """基于英文原文命中项核对译文是否包含相应 target。返回缺失清单。"""
+    """
+    基于英文原文命中项，检查：
+    - hit_in_english: 该 source 是否出现在英文原文中
+    - found_target_in_zh: 任一 target 是否出现在译文中
+    - found_source_in_zh: 英文 source 本身是否仍残留在译文中（用于自动修复）
+    """
     if not english or merged is None or merged.empty:
-        return pd.DataFrame(columns=["source", "target", "type", "found_in_translation"])
+        return pd.DataFrame(columns=[
+            "source", "target", "type",
+            "hit_in_english", "found_target_in_zh", "found_source_in_zh",
+        ])
+
+    # 构建英文命中
     gdf = build_patterns(merged.drop(columns=["pattern"], errors="ignore"))
     hits = find_hits(english, gdf) or []
     dedup = {}
     for h in hits:
         if h.term not in dedup:
             dedup[h.term] = h
+
     records = []
-    t = translated or ""
+    zh = translated or ""
     for term, _h in dedup.items():
         rows = merged[merged["source"] == term]
         if rows.empty:
             continue
-        any_found = False
+
+        targets = []
         for _, r in rows.iterrows():
             tgt = str(r.get("target") or "").strip()
-            if not tgt:
-                continue
-            if tgt in t:
-                any_found = True
+            if tgt:
+                targets.append(tgt)
+
+        # 译文中是否已经有任意一个 target
+        any_target = False
+        for tgt in targets:
+            if tgt in zh:
+                any_target = True
                 break
+
         records.append({
             "source": term,
-            "target": "; ".join(rows["target"].astype(str).tolist()),
+            "target": "; ".join(targets),
             "type": rows.iloc[0].get("type"),
-            "found_in_translation": bool(any_found),
+            "hit_in_english": True,
+            "found_target_in_zh": any_target,
+            "found_source_in_zh": term in zh,
         })
+
     df = pd.DataFrame.from_records(records)
     if not df.empty:
-        df = df.sort_values(["found_in_translation", "type", "source"], ascending=[True, True, True])
+        df = df.sort_values(
+            ["found_target_in_zh", "type", "source"],
+            ascending=[True, True, True]
+        )
     return df
 
+def _apply_glossary_repairs(translated: str, cov_df: pd.DataFrame) -> str:
+    """
+    根据覆盖报告自动修复：
+    - 条件：hit_in_english=True 且 found_target_in_zh=False 且 found_source_in_zh=True
+    - 操作：把译文中的英文 source 替换为语料库中第一个 target
+    """
+    if translated is None:
+        return ""
+    if cov_df is None or cov_df.empty:
+        return translated
+
+    text = translated
+    for _, row in cov_df.iterrows():
+        try:
+            src = str(row.get("source") or "").strip()
+            targets = [t.strip() for t in str(row.get("target") or "").split(";") if t.strip()]
+            if not src or not targets:
+                continue
+
+            # 只对「英文原文中出现过、译文中还残留 source、且没有 target」的条目做替换
+            if not row.get("hit_in_english"):
+                continue
+            if row.get("found_target_in_zh"):
+                continue
+            if not row.get("found_source_in_zh"):
+                continue
+
+            first_target = targets[0]
+            # 简单按子串替换；如需更严格可改成带词边界的正则
+            pattern = re.compile(re.escape(src))
+            text = pattern.sub(first_target, text)
+        except Exception:
+            # 防御性兜底，单条失败不影响整体
+            continue
+
+    return text
 # =============================
 # Streamlit UI
 # =============================
@@ -441,9 +500,9 @@ with T3:
         st.markdown("**系统提示（用于调用翻译）**")
         st.code(sys_prompt, language="json")
 
-        rep = quick_qc(len(hits), len(names))
+        rep = quick_qc(len(hits))
         with st.expander("快速质量检查"):
-            st.json({"glossary_hits": rep.glossary_hits, "names_detected": rep.names_detected, "violations": rep.violations})
+            st.json({"glossary_hits": rep.glossary_hits, "violations": rep.violations})
 
         temp = 1.0
         st.caption("temperature 已固定为 1（该模型仅支持默认值）。")
@@ -590,19 +649,19 @@ with T5:
     st.subheader("对已翻译 TXT 做一致性质检与快速修复")
     st.caption("检查点：① 术语覆盖（英文原文命中 → 译文是否包含 target）；② 军衔顺序（应为“名字 在前，军衔 在后”）；③ 段落空行（段落间至少一个空行）。")
 
-    # —— 上传区：用 getvalue()，避免被 .read() 消耗后为空 ——
+    # 上传：使用 getvalue()，避免被 .read() 消耗
     colL, colR = st.columns(2)
     with colL:
         en_up = st.file_uploader("上传英文原文 TXT（用于术语命中）", type=["txt"], key="qc_en")
     with colR:
         zh_up = st.file_uploader("上传中文译文 TXT（待质检/修复）", type=["txt"], key="qc_zh")
 
-    # —— 取会话内语料，合并并收集军衔词表 ——
+    # 语料库合并 & 军衔词表
     corpora = st.session_state.get("corpora", {})
     merged = _merge_corpora_for_check(corpora)
     ranks = _collect_rank_words(merged)
 
-    # —— 从上传组件读文本（持久化到 session_state，避免因重跑丢失） ——
+    # 把上传内容缓存到 session_state
     if en_up:
         st.session_state["qc_en_text"] = en_up.getvalue().decode("utf-8", errors="ignore")
     if zh_up:
@@ -611,7 +670,7 @@ with T5:
     en_text = st.session_state.get("qc_en_text", "")
     zh_text = st.session_state.get("qc_zh_text", "")
 
-    # —— 质检按钮：把结果写入 session_state —— 
+    # 开始质检：写入 session_state 方便后续操作
     if st.button("开始质检", disabled=not (en_text and zh_text)):
         cov_df = _glossary_coverage(en_text, zh_text, merged)
         issues = _find_rank_order_issues(zh_text, ranks)
@@ -624,27 +683,43 @@ with T5:
 
         st.success("质检完成（结果已缓存，可在下方查看/修复）。")
 
-    # —— 展示质检结果：从 session_state 读取 —— 
+    # 从 session_state 取结果
     cov_df = st.session_state.get("qc_cov_df", None)
     issues = st.session_state.get("qc_issues", None)
     fixed_para = st.session_state.get("qc_fixed_para", None)
     ranks_cached = st.session_state.get("qc_ranks", ranks)
 
-    st.markdown("### 术语覆盖报告")
+    # —— 术语覆盖报告 —— 
+    st.markdown("### 术语覆盖报告（含自动修复信息）")
     if cov_df is None:
         st.info("请先点击“开始质检”。")
     else:
-        missing_df = cov_df[cov_df["found_in_translation"] == False] if not cov_df.empty else pd.DataFrame(columns=cov_df.columns)
         if cov_df.empty:
-            st.info("未识别到任何术语命中，或语料库为空。")
+            st.info("未识别到任何语料库命中，或语料库为空。")
         else:
-            st.dataframe(cov_df, use_container_width=True, height=260)
-            st.download_button("下载覆盖报告 CSV", cov_df.to_csv(index=False).encode("utf-8"), file_name="coverage_report.csv")
-        if missing_df is not None and not missing_df.empty:
-            st.warning(f"缺失 {len(missing_df)} 项译名未出现在译文中（建议人工复核或二次替换）。")
-        else:
-            st.success("未发现遗漏词条（或无法判断）。")
+            # 标出“需要修复”的条目：英文命中 + 译文无 target + 译文仍残留 source
+            need_fix_mask = (
+                (cov_df["hit_in_english"] == True) &
+                (cov_df["found_target_in_zh"] == False) &
+                (cov_df["found_source_in_zh"] == True)
+            )
+            cov_df_show = cov_df.copy()
+            cov_df_show["need_auto_fix"] = need_fix_mask
 
+            st.dataframe(cov_df_show, use_container_width=True, height=260)
+            st.download_button(
+                "下载覆盖报告 CSV",
+                cov_df_show.to_csv(index=False).encode("utf-8"),
+                file_name="coverage_report.csv",
+            )
+
+            n_need_fix = int(need_fix_mask.sum())
+            if n_need_fix > 0:
+                st.warning(f"有 {n_need_fix} 条术语在英文中出现，但译文本身仍留英文且未使用语料库 target，将在一键修复中自动替换。")
+            else:
+                st.success("未发现需要自动修复的术语（或无法判断）。")
+
+    # —— 军衔顺序检查 —— 
     st.markdown("### 军衔顺序检查（应为“名字 在前，军衔 在后”）")
     if issues is None:
         st.info("请先点击“开始质检”。")
@@ -659,37 +734,37 @@ with T5:
             st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, height=220)
             st.caption(f"共发现 {len(issues)} 处。")
 
+    # —— 段落空行 —— 
     st.markdown("### 段落空行")
     if fixed_para is None:
         st.info("请先点击“开始质检”。")
     else:
         if fixed_para != zh_text:
-            st.info("检测到段落空行问题，已生成修复版本（预览在下载文件中）。")
+            st.info("检测到段落空行问题，已生成修复版本（将在一键修复中使用）。")
         else:
             st.success("段落空行看起来正常。")
 
     st.markdown("---")
-    st.subheader("一键修复（可选）")
+    st.subheader("一键修复（语料库术语 + 军衔顺序 + 段落空行）")
 
-    # —— 把复选框的值放进 session_state，避免点击后重跑丢失 —— 
     st.checkbox("自动把 ‘军衔 名字’ 互换为 ‘名字 军衔’（仅英文名字场景）", key="qc_do_swap", value=False)
-
-    # —— 文件名输入放在按钮外，避免重跑丢失 —— 
     fix_filename = st.text_input("保存文件名", value="translated_fixed.txt", key="qc_fix_filename")
 
-    # —— 应用修复按钮：根据 session_state 生成下载内容 —— 
-    apply_disabled = fixed_para is None  # 还没质检就不能修复
+    apply_disabled = fixed_para is None
     if st.button("应用修复并下载 TXT", disabled=apply_disabled):
-        # 重新读取最新的 fixed_para/issues（来自 session_state）
-        fixed_para = st.session_state.get("qc_fixed_para", "")
+        cov_df = st.session_state.get("qc_cov_df", None)
+        fixed_para = st.session_state.get("qc_fixed_para", zh_text)
         issues = st.session_state.get("qc_issues", [])
         ranks_cached = st.session_state.get("qc_ranks", ranks)
-        out_txt = fixed_para or zh_text
 
+        # 1) 先用语料库做术语修复（英文 source → 中文 target）
+        out_txt = _apply_glossary_repairs(fixed_para or zh_text, cov_df)
+
+        # 2) 可选：军衔顺序修复
         if st.session_state.get("qc_do_swap", False) and issues:
             out_txt = _auto_fix_rank_order(out_txt, ranks_cached)
 
-        # 用 download_button 输出文件内容（按钮要在同一帧渲染时拿到数据）
+        # 3) 下载
         st.download_button(
             "下载修复后 TXT",
             data=out_txt.encode("utf-8"),
